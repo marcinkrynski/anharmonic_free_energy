@@ -20,11 +20,16 @@ def list_of_directories(fpath):
 
 #performs integration with trapezoid method
 def intgrt(x, y):
-   I = [0]
-   for i in range(1, len(x)):
-       I.append(np.trapz(y[:i+1], x[:i+1]))
-   I = np.array(I)
-   return I
+    I = [0]
+    err = [0]
+    for i in range(1, len(x)):
+        I.append(np.trapz(y[:i+1], x[:i+1]))
+        y_p = np.gradient(y[:i+1])
+        err.append((((x[-1]-x[0])**2)/(12*len(x)**2))*(y_p[-1]-y_p[0]))
+        
+    I = np.array(I)
+    err = np.array(err)
+    return I, err
 
 def lammps_log_to_U_latt(fpath):
     file = open(fpath+'log.lammps')
@@ -96,12 +101,26 @@ def phonopy_harmonic_free_energy(fpath, T, nmols, U_latt):
                 )
     return np.asanyarray(Fq)*J2ev/nmols + U_latt, np.asanyarray(Fc)*J2ev/nmols + U_latt
 
+def _error_from_u(u):
+    ug = np.gradient(u)
+    c = []
+    for i in range(1000):
+        t1 = np.arange(0, len(ug)-i,1)
+        t2 = np.arange(i, len(ug),1)
+        c.append(np.sum(ug[t1]*ug[t2]))
+    c = np.array(c)
+    c = c/c[0]
+    c = c*np.sign(c)
+    c_trs = np.sum(c>.1)
+    N_independent = len(u)/c_trs
+    return np.std(u)/(N_independent**.5)
+
 #reads md temperature and potential energy from simulation.out files
 #within subfolders in folder 'fpath'
 #steps_excluded is number of initial excluded steps
 #returns temperature in K and potential energy in eV
 #both quantities are sorted with respect to the temperature
-def ipi_md_potential(fpath, nmols, bexclude=100):
+def ipi_md_potential(fpath, nmols, bexclude=1000):
     subfolders = np.array(list_of_directories(fpath))
     sub = np.array(subfolders, int)
     idx = np.argsort(sub)
@@ -109,8 +128,7 @@ def ipi_md_potential(fpath, nmols, bexclude=100):
         
     T = []
     U = []
-    U_std = []
-#    U_std_convergence = []
+    err = []
     for folder in subfolders:
         fpath_ = fpath+folder
         file = open(fpath_+'/simulation.out')
@@ -124,9 +142,10 @@ def ipi_md_potential(fpath, nmols, bexclude=100):
 
         T.append(np.mean(data_matrix[:,3]))
         U.append(np.mean(data_matrix[:,5]))
-        U_std.append(np.std(data_matrix[:,5]/nmols))
-        
-    return np.asanyarray(T), np.asanyarray(subfolders, float), np.asanyarray(U)/nmols, np.asanyarray(U_std)
+        err.append(
+                _error_from_u(data_matrix[:,5])
+                )
+    return np.asanyarray(T), np.asanyarray(subfolders, float), np.asanyarray(U)/nmols, np.asanyarray(err)/nmols
 
 #returns harmonic potential energy for given nuner of atoms
 def harmonic_potential_energy(T,N):
@@ -137,14 +156,22 @@ def anharmonic_energy(U_md, U_harm, U_latt):
     return U_md - U_harm - U_latt
 
 #returns integrated anharmonic energy
-def integrated_anharmonic_energy(T, U_anharm):
+def integrated_anharmonic_energy(T, U_anharm, U_err):
     xs = T
     ys = U_anharm/(T**2)/kb_ev
+    ys_err = U_err/(T**2)/kb_ev
     
     xl = np.log(T/T[0])
     yl = U_anharm/np.exp(xl)/T[0]/kb_ev
+    yl_err = U_err/np.exp(xl)/T[0]/kb_ev
 
-    return intgrt(xs, ys), intgrt(xl, yl)
+    int_s = intgrt(xs, ys)
+    int_l = intgrt(xl, yl)
+    
+    int_s_err = intgrt(xs, ys_err)
+    int_l_err = intgrt(xl, yl_err)
+
+    return int_s[0], int_s[1], int_l[0], int_l[1], int_s_err[0], int_l_err[0]
 
 #returns temperature and potential energy ffrom FF->DFT calculation
 def ipi_to_two_potentials(path, cut):
@@ -186,7 +213,7 @@ class fesample:
         self.U_latt = lammps_log_to_U_latt(self.__ulatt_fpath )/self.__ulatt_nmols
         
         #read temperature and u_md
-        self.T, self.Tf, self.u_md, self.u_md_std = ipi_md_potential(
+        self.T, self.Tf, self.u_md, self.u_md_err = ipi_md_potential(
                 self.__md_fpath,
                 self.__md_nmols,
                 bexclude=1000,
@@ -205,17 +232,21 @@ class fesample:
                 self.__fharm_nmols_phonopy,
                 self.U_latt,
                 )
-        
-        
+
+
         ###calculatin angarmonic free energy##
         ###calculatin angarmonic free energy##
         #calculating anharmonic integral
         self.u_harm = harmonic_potential_energy(self.Tf, self.__u_harm_natoms)/self.__u_harm_nmols
         self.u_anharm = anharmonic_energy(self.u_md, self.u_harm, self.U_latt)
-        self.anharm_integral_str, self.anharm_integral_log = integrated_anharmonic_energy(
-                self.Tf,
-                self.u_anharm,
-                )
+        (
+            self.anharm_integral_str,
+            self.anharm_integral_str_err,
+            self.anharm_integral_log,
+            self.anharm_integral_log_err,
+            self.anharm_integral_str_md_err,
+            self.anharm_integral_log_md_err,
+        ) = integrated_anharmonic_energy(self.Tf, self.u_anharm, self.u_md_err)
 
         #calculating harmonic part
         self.f_harm_part = (self.F_harm_c_ipi[0]-self.U_latt)*self.Tf/self.Tf[0]
@@ -224,10 +255,20 @@ class fesample:
         self.f_class_nucl = kb_ev*self.Tf*(3*self.__u_harm_natoms-3)*np.log(self.Tf/self.Tf[0])/self.__u_harm_nmols
         
         #calculating classical anharmonic free energy
-        self.F_anh_c = self.U_latt + self.f_harm_part - self.f_class_nucl - self.anharm_integral_str*kb_ev*self.Tf
+        self.F_anh_c = self.U_latt + self.f_harm_part - self.f_class_nucl - self.anharm_integral_log*kb_ev*self.Tf
         
         #calculating quantum anharmonic free energy
         self.F_anh_q = self.F_anh_c + self.F_harm_q_ipi - self.F_harm_c_ipi
         
         #calculating the error of the TI parht of anharmonic free energy
-        self.F_anh_err = self.Tf*intgrt(self.Tf, self.u_md_std * self.Tf**-2)
+        self.F_err_int_ti_log = self.Tf*self.anharm_integral_log_err*kb_ev
+        self.F_err_int_ti_str = self.Tf*self.anharm_integral_str_err*kb_ev
+        
+        #calculating the error of the TI parht of anharmonic free energy
+        self.F_err_md_str = self.Tf*self.anharm_integral_str_md_err*kb_ev
+        self.F_err_md_log = self.Tf*self.anharm_integral_log_md_err*kb_ev
+        
+        self.F_anh_err = (
+                np.absolute(self.F_err_md_log) +
+                np.absolute(self.F_err_int_ti_log)
+                )
