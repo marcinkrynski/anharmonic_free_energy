@@ -157,24 +157,15 @@ def anharmonic_energy(U_md, U_harm, U_latt):
 
 #returns integrated anharmonic energy
 def integrated_anharmonic_energy(T, U_anharm, U_err):
-    xs = T
-    ys = U_anharm/(T**2)/kb_ev
-    ys_err = U_err/(T**2)/kb_ev
-    
-    xl = np.log(T/T[0])
-    yl = U_anharm/np.exp(xl)/T[0]/kb_ev
-    yl_err = U_err/np.exp(xl)/T[0]/kb_ev
-
-    int_s = intgrt(xs, ys)
-    int_l = intgrt(xl, yl)
-    
-    int_s_err = intgrt(xs, ys_err)
-    int_l_err = intgrt(xl, yl_err)
-
-    return int_s[0], int_s[1], int_l[0], int_l[1], int_s_err[0], int_l_err[0]
+    x = np.log(T/T[0])
+    y = U_anharm/np.exp(x)/T[0]/kb_ev
+    y_err = U_err/np.exp(x)/T[0]/kb_ev
+    integral = intgrt(x, y)
+    int_err = intgrt(x, y_err)
+    return integral[0], integral[1], int_err[0]
 
 #returns temperature and potential energy ffrom FF->DFT calculation
-def ipi_to_two_potentials(path, cut):
+def ipi_to_two_potentials(path, cut=200):
     file = open(path)
     lines = file.readlines()[1:]
     file.close()
@@ -186,10 +177,33 @@ def ipi_to_two_potentials(path, cut):
     time = data[cut:, 1]
     pot_1 = data[cut:, 7]
     pot_2 = data[cut:, 8]
+    pot_1_er = _error_from_u(pot_1)
+    pot_2_er = _error_from_u(pot_2)
     
-    return time, pot_1, pot_2
+    return time, pot_1, pot_2, pot_1_er, pot_2_er
 
-class fesample:
+def integrated_ff_2_dft(fpath, nmols):
+    ff_dft_subf = list_of_directories(fpath)
+    ff_dft_du = []
+    ff_dft_du_err = []
+    _lambda = []
+    for subf in ff_dft_subf:
+        time, pot_1, pot_2, pot_1_er, pot_2_er = ipi_to_two_potentials(fpath+subf+'/simulation.out')
+        ff_dft_du_err.append((pot_1_er + pot_2_er)/2)
+        ff_dft_du.append(np.mean(pot_2 - pot_1)/nmols)
+        _lambda.append(float(subf))
+    
+    idx = np.argsort(_lambda)
+    _lambda = np.array(_lambda)[idx]
+    ff_dft_du = np.array(ff_dft_du)[idx]
+    ff_dft_du_err = np.array(ff_dft_du_err)[idx]
+    lambda_av = np.mean(np.gradient(_lambda))
+    
+    F_ff_dft, F_ff_dft_err_int = intgrt(_lambda, ff_dft_du/lambda_av)
+    F_ff_dft_err_md, _a = intgrt(_lambda, ff_dft_du_err/lambda_av)
+    return F_ff_dft, F_ff_dft_err_md, F_ff_dft_err_int
+
+class fe_sample:
     def __init__(
             self,
             ulatt_fpath, ulatt_nmols,
@@ -197,6 +211,7 @@ class fesample:
             u_harm_natoms, u_harm_nmols,
             fharm_fpath_phonopy, fharm_nmols_phonopy,
             fharm_fpath_ipi, fharm_nmols_ipi,
+            ff_dft_fpath, ff_dft_nmols,
             ):
         self.__ulatt_fpath = ulatt_fpath
         self.__ulatt_nmols = ulatt_nmols
@@ -208,6 +223,8 @@ class fesample:
         self.__fharm_nmols_phonopy = fharm_nmols_phonopy
         self.__fharm_fpath_ipi = fharm_fpath_ipi
         self.__fharm_nmols_ipi = fharm_nmols_ipi
+        self.__ff_dft_fpath = ff_dft_fpath
+        self.__ff_dft_nmols = ff_dft_nmols
         
         #read lattice energy
         self.U_latt = lammps_log_to_U_latt(self.__ulatt_fpath )/self.__ulatt_nmols
@@ -219,7 +236,7 @@ class fesample:
                 bexclude=1000,
                 )
         
-        #calculate harmonic free energy, quantum and classical
+        ###calculate harmonic free energy, quantum and classical###
         self.F_harm_q_ipi, self.F_harm_c_ipi = ipi_harmonic_free_energy(
                 self.__fharm_fpath_ipi,
                 self.Tf,
@@ -235,17 +252,13 @@ class fesample:
 
 
         ###calculatin angarmonic free energy##
-        ###calculatin angarmonic free energy##
         #calculating anharmonic integral
         self.u_harm = harmonic_potential_energy(self.Tf, self.__u_harm_natoms)/self.__u_harm_nmols
         self.u_anharm = anharmonic_energy(self.u_md, self.u_harm, self.U_latt)
         (
-            self.anharm_integral_str,
-            self.anharm_integral_str_err,
-            self.anharm_integral_log,
-            self.anharm_integral_log_err,
-            self.anharm_integral_str_md_err,
-            self.anharm_integral_log_md_err,
+            self.anharm_integral,
+            self.anharm_integral_err,
+            self.anharm_integral_md_err,
         ) = integrated_anharmonic_energy(self.Tf, self.u_anharm, self.u_md_err)
 
         #calculating harmonic part
@@ -255,20 +268,25 @@ class fesample:
         self.f_class_nucl = kb_ev*self.Tf*(3*self.__u_harm_natoms-3)*np.log(self.Tf/self.Tf[0])/self.__u_harm_nmols
         
         #calculating classical anharmonic free energy
-        self.F_anh_c = self.U_latt + self.f_harm_part - self.f_class_nucl - self.anharm_integral_log*kb_ev*self.Tf
+        self.F_anh_c = self.U_latt + self.f_harm_part - self.f_class_nucl - self.anharm_integral*kb_ev*self.Tf
         
         #calculating quantum anharmonic free energy
         self.F_anh_q = self.F_anh_c + self.F_harm_q_ipi - self.F_harm_c_ipi
         
         #calculating the error of the TI parht of anharmonic free energy
-        self.F_err_int_ti_log = self.Tf*self.anharm_integral_log_err*kb_ev
-        self.F_err_int_ti_str = self.Tf*self.anharm_integral_str_err*kb_ev
+        self.F_err_int_ti = self.Tf*self.anharm_integral_err*kb_ev
         
         #calculating the error of the TI parht of anharmonic free energy
-        self.F_err_md_str = self.Tf*self.anharm_integral_str_md_err*kb_ev
-        self.F_err_md_log = self.Tf*self.anharm_integral_log_md_err*kb_ev
+        self.F_err_md = self.Tf*self.anharm_integral_md_err*kb_ev
         
         self.F_anh_err = (
-                np.absolute(self.F_err_md_log) +
-                np.absolute(self.F_err_int_ti_log)
+                np.absolute(self.F_err_md) +
+                np.absolute(self.F_err_int_ti)
                 )
+        self.F_ff_dft, self.F_ff_dft_err_md, self.F_ff_dft_err_int = integrated_ff_2_dft(
+                self.__ff_dft_fpath,
+                self.__ff_dft_nmols,
+                )
+        self.F_ff_dft = self.F_ff_dft[-1]
+        self.F_ff_dft_err_md = np.abs(self.F_ff_dft_err_md[-1])
+        self.F_ff_dft_err_int = np.abs(self.F_ff_dft_err_int[-1])
